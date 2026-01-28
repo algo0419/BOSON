@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 """
 remember to write the code so that it coudld be used for four devices
 need to complete the four devices by the end of today
@@ -8,13 +10,13 @@ need to complete the four devices by the end of today
 import argparse
 import datetime
 import os
-from typing import List
+import platform
+from typing import Any, List, cast
 
 import matplotlib.pyplot as plt
 import mlflow
 import numpy as np
 import torch
-import torch.cuda.amp as amp
 import torch.fft
 from pyutils.config import configs
 from pyutils.general import AverageMeter
@@ -28,25 +30,62 @@ from pyutils.torch_train import (
 )
 from pyutils.typing import Criterion, Optimizer, Scheduler
 
-import wandb
+import wandb as _wandb
 from core import builder
 from core.inv_litho.photonic_model import *
 from core.models.layers import *
 
 RECORD_TO_CSV = False
 
+_amp_module = getattr(torch, "amp", None)
+if _amp_module is None:
+    from torch.cuda import amp as _amp_module  # fallback for older torch versions
+amp = cast(Any, _amp_module)
+wandb = cast(Any, _wandb)
+
+
+def _amp_device_type() -> str:
+    return "cuda" if torch.cuda.is_available() and int(configs.run.use_cuda) else "cpu"
+
+
+def _scalar_or_value(value: Any) -> Any:
+    if isinstance(value, torch.Tensor):
+        return value.item()
+    if isinstance(value, np.ndarray):
+        return value.item() if value.size == 1 else value
+    return value
+
+
+def _autocast(enabled: bool):
+    if hasattr(amp, "autocast"):
+        try:
+            return amp.autocast(device_type=_amp_device_type(), enabled=enabled)
+        except TypeError:
+            return amp.autocast(enabled=enabled)
+    return torch.cuda.amp.autocast(enabled=enabled)
+
+
+def _make_grad_scaler(enabled: bool):
+    if hasattr(amp, "GradScaler"):
+        try:
+            return amp.GradScaler(device_type=_amp_device_type(), enabled=enabled)
+        except TypeError:
+            return amp.GradScaler(enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
 
 def get_adjoint_gradient(
     model,
     optimizer,
     grad_scaler,
-    criterion,
-    aux_criterions,
+    criterion: torch.nn.Module,
+    aux_criterions: dict[str, list[Any]],
     sharpness,
     device_resolution,
     eval_resolution,
 ):
-    with amp.autocast(enabled=grad_scaler._enabled):
+    assert grad_scaler is not None
+    with _autocast(grad_scaler.is_enabled()):
         # run first time with a high resoltuion 200
         # TODO think about the resolution to use in the first step
         output_GT = model(
@@ -92,19 +131,20 @@ def get_adjoint_gradient(
 def train_dev(
     model,
     optimizer: Optimizer,
-    ascend_optimizer: Optimizer,
+    ascend_optimizer: Optimizer | None,
     lr_scheduler: Scheduler,
-    ascend_lr_scheduler: Scheduler,
+    ascend_lr_scheduler: Scheduler | None,
     sharp_scheduler: Scheduler,
     res_scheduler: Scheduler,
     eval_prob_scheduler: Scheduler,
     epoch: int,
-    criterion: Criterion,
-    aux_criterions: Criterion,
+    criterion: torch.nn.Module,
+    aux_criterions: dict[str, list[Any]],
     plot: bool = False,
-    grad_scaler=None,
+    grad_scaler: Any = None,
     recorder=None,
 ) -> None:
+    assert grad_scaler is not None
     torch.autograd.set_detect_anomaly(True)
     model.train()
     # reset the temperature and eta before the inner loop
@@ -165,6 +205,8 @@ def train_dev(
     eval_prob = eval_prob_scheduler.step()
 
     if configs.run.sam:
+        assert ascend_optimizer is not None
+        assert ascend_lr_scheduler is not None
         # in the inner loop we use gradient ascend to find the worst case
         # the flag inner_loop is used to control the forward pass of the model
         model.inner_loop = True
@@ -172,10 +214,12 @@ def train_dev(
         model.temperature.requires_grad = True
         model.eta.requires_grad = True
         for i in range(1, configs.run.n_epoch_inner + 1):
-            with amp.autocast(enabled=grad_scaler._enabled):
+            with _autocast(grad_scaler.is_enabled()):
+                sharp_scheduler_any = cast(Any, sharp_scheduler)
+                res_scheduler_any = cast(Any, res_scheduler)
                 output = model(
-                    sharpness=sharp_scheduler.get_sharpness(),
-                    device_resolution=res_scheduler.get_resolution(),
+                    sharpness=sharp_scheduler_any.get_sharpness(),
+                    device_resolution=res_scheduler_any.get_resolution(),
                     eval_resolution=configs.res_scheduler.eval_res,
                 )
                 if isinstance(output, tuple):
@@ -206,6 +250,8 @@ def train_dev(
         model.temperature.requires_grad = False
         model.eta.requires_grad = False
 
+    ls_knots_grad_GT = None
+    ls_knots_grad_no_subpx = None
     if configs.run.compare_grad_similarity and (epoch % 10 == 0 or epoch == 1):
         assert model.if_subpx_smoothing
         model.if_subpx_smoothing = False
@@ -230,7 +276,7 @@ def train_dev(
             configs.res_scheduler.eval_res,
         )
         model.if_subpx_smoothing = True
-    with amp.autocast(enabled=grad_scaler._enabled):
+    with _autocast(grad_scaler.is_enabled()):
         output = model(
             sharpness=sharpness,
             device_resolution=resolution,
@@ -250,41 +296,13 @@ def train_dev(
         # loss = regression_loss
         # ----------------------------------------
         if recorder is not None:
-            recorder[0, epoch - 1] = (
-                main_out["contrast_ratio"]
-                if isinstance(main_out["contrast_ratio"], torch.Tensor)
-                else main_out["contrast_ratio"]
-            )
-            recorder[1, epoch - 1] = (
-                main_out["transmission"][0].item()
-                if isinstance(main_out["transmission"][0], torch.Tensor)
-                else main_out["transmission"][0]
-            )
-            recorder[2, epoch - 1] = (
-                main_out["radiation"][0].item()
-                if isinstance(main_out["radiation"][0], torch.Tensor)
-                else main_out["radiation"][0]
-            )
-            recorder[3, epoch - 1] = (
-                main_out["reflection"][0].item()
-                if isinstance(main_out["reflection"][0], torch.Tensor)
-                else main_out["reflection"][0]
-            )
-            recorder[4, epoch - 1] = (
-                main_out["transmission"][1].item()
-                if isinstance(main_out["transmission"][1], torch.Tensor)
-                else main_out["transmission"][1]
-            )
-            recorder[5, epoch - 1] = (
-                main_out["radiation"][1].item()
-                if isinstance(main_out["radiation"][1], torch.Tensor)
-                else main_out["radiation"][1]
-            )
-            recorder[6, epoch - 1] = (
-                main_out["reflection"][1].item()
-                if isinstance(main_out["reflection"][1], torch.Tensor)
-                else main_out["reflection"][1]
-            )
+            recorder[0, epoch - 1] = _scalar_or_value(main_out["contrast_ratio"])
+            recorder[1, epoch - 1] = _scalar_or_value(main_out["transmission"][0])
+            recorder[2, epoch - 1] = _scalar_or_value(main_out["radiation"][0])
+            recorder[3, epoch - 1] = _scalar_or_value(main_out["reflection"][0])
+            recorder[4, epoch - 1] = _scalar_or_value(main_out["transmission"][1])
+            recorder[5, epoch - 1] = _scalar_or_value(main_out["radiation"][1])
+            recorder[6, epoch - 1] = _scalar_or_value(main_out["reflection"][1])
         # comment out the penalty (regression_loss) of hole distance
         loss = main_out["loss"]  # remember to put the key loss to the main_out
 
@@ -304,6 +322,8 @@ def train_dev(
     grad_scaler.scale(loss).backward(retain_graph=True)
     # grad_scaler.scale(loss).backward()
     if configs.run.compare_grad_similarity and (epoch % 10 == 0 or epoch == 1):
+        assert ls_knots_grad_GT is not None
+        assert ls_knots_grad_no_subpx is not None
         # record the gradient of the levelset related parameters
         ls_knots_grad_subpx = model.ls_knots.grad.clone().detach()
         # calculate the gradient similarity
@@ -354,18 +374,10 @@ def train_dev(
         else:
             log += f" {key}: {value} |"
 
-        wandb.log(
-            {
-                key: value.data.item() if isinstance(value, torch.Tensor) else value,
-            },
-        )
+        wandb.log({key: _scalar_or_value(value)})
     for name, meter in aux_meters.items():
         log += f" {name}: {meter.avg:.4e} | "
-        wandb.log(
-            {
-                name: meter.avg,
-            },
-        )
+        wandb.log({name: meter.avg})
 
     lg.info(log)
 
@@ -420,8 +432,8 @@ def test_dev(
     sharp_scheduler: Scheduler,
     res_scheduler: Scheduler,
     epoch: int,
-    criterion: Criterion,
-    aux_criterions: Criterion,
+    criterion: torch.nn.Module,
+    aux_criterions: dict[str, list[Any]],
     lossv: List,
     plot: bool = False,
 ) -> None:
@@ -431,8 +443,10 @@ def test_dev(
     aux_meters = {name: AverageMeter(name) for name in aux_criterions}
 
     with torch.no_grad():
-        sharpness = sharp_scheduler.get_sharpness()
-        device_resolution = res_scheduler.get_resolution()
+        sharp_scheduler_any = cast(Any, sharp_scheduler)
+        res_scheduler_any = cast(Any, res_scheduler)
+        sharpness = sharp_scheduler_any.get_sharpness()
+        device_resolution = res_scheduler_any.get_resolution()
         output = model(
             sharpness=sharpness,
             device_resolution=device_resolution,
@@ -479,13 +493,7 @@ def test_dev(
         else:
             log += f" {key}: {value} | "
 
-        wandb.log(
-            {
-                key + "_test": value.data.item()
-                if isinstance(value, torch.Tensor)
-                else value,
-            },
-        )
+        wandb.log({key + "_test": _scalar_or_value(value)})
     lg.info(log)
 
     mlflow.log_metrics({"train_loss": loss.item()}, step=step)
@@ -538,15 +546,19 @@ def match_prelitho_pattern(
     sharp_scheduler: Scheduler,
     res_scheduler: Scheduler,
     epoch: int,
-    criterion: Criterion,
-    grad_scaler: amp.GradScaler = None,
-    target_eps: tuple = None,
+    criterion: torch.nn.Module,
+    grad_scaler: Any,
+    target_eps: torch.Tensor | None = None,
     plot: bool = False,
-    lossv: list = [],
+    lossv: list[float] | None = None,
 ):
     torch.autograd.set_detect_anomaly(True)
     model.train()
     step = epoch
+    if target_eps is None:
+        raise ValueError("target_eps must be provided")
+    if lossv is None:
+        lossv = []
 
     if plot and epoch == 1:
         with torch.no_grad():
@@ -588,9 +600,11 @@ def match_prelitho_pattern(
         )
         # model.plot_level_set(configs.model.sim_cfg.resolution, filepath[:-4])
 
+    if lossv is None:
+        lossv = []
     sharpness = sharp_scheduler.step()
     resolution = res_scheduler.step()
-    with amp.autocast(enabled=grad_scaler._enabled):
+    with _autocast(grad_scaler.is_enabled()):
         output = model(
             sharpness=sharpness,
             resolution=configs.res_scheduler.final_res,
@@ -613,6 +627,8 @@ def match_prelitho_pattern(
             )
         elif model.matching_mode == "nominal":
             loss = criterion(matched_design_region[0], target_eps[0])
+        else:
+            raise ValueError(f"Unsupported matching_mode: {model.matching_mode}")
         lossv.append(loss.item())
 
     grad_scaler.scale(loss).backward(retain_graph=True)
@@ -637,13 +653,7 @@ def match_prelitho_pattern(
             else:
                 log += f" {key}: {value} |"
 
-            wandb.log(
-                {
-                    key: value.data.item()
-                    if isinstance(value, torch.Tensor)
-                    else value,
-                },
-            )
+            wandb.log({key: _scalar_or_value(value)})
 
     lg.info(log)
     lr_scheduler.step()
@@ -687,9 +697,10 @@ def main() -> None:
     if int(configs.run.deterministic):
         set_torch_deterministic(int(configs.run.random_state))
 
+    random_state = int(configs.run.random_state) if int(configs.run.deterministic) else None
     model = builder.make_model(
         device,
-        int(configs.run.random_state) if int(configs.run.deterministic) else None,
+        random_state,
     )
     lg.info(model)
 
@@ -785,7 +796,7 @@ def main() -> None:
         format="{:.4f}",
     )
 
-    grad_scaler = amp.GradScaler(enabled=getattr(configs.run, "fp16", False))
+    grad_scaler = _make_grad_scaler(enabled=getattr(configs.run, "fp16", False))
     lg.info(f"Number of parameters: {count_parameters(model)}")
 
     model_name = f"{configs.model.device_type}"
@@ -794,19 +805,31 @@ def main() -> None:
 
     lg.info(f"Current checkpoint: {checkpoint}")
 
-    wandb.login()
     tag = wandb.util.generate_id()
     group = f"{datetime.date.today()}"
     name = f"{configs.run.wandb.name}-{datetime.datetime.now().hour:02d}{datetime.datetime.now().minute:02d}{datetime.datetime.now().second:02d}-{tag}"
     configs.run.pid = os.getpid()
-    # wandb.require("core")
-    run = wandb.init(
-        project=configs.run.wandb.project,
-        group=group,
-        name=name,
-        id=tag,
-        config=configs,
-    )
+    try:
+        wandb.login()
+        run = wandb.init(
+            project=configs.run.wandb.project,
+            group=group,
+            name=name,
+            id=tag,
+            config=configs,
+        )
+    except Exception as exc:
+        lg.warning(
+            f"W&B init failed ({exc}). Falling back to disabled mode."
+        )
+        run = wandb.init(
+            mode="disabled",
+            project=configs.run.wandb.project,
+            group=group,
+            name=name,
+            id=tag,
+            config=configs,
+        )
 
     lossv = [0]
     epoch = 0
@@ -816,8 +839,10 @@ def main() -> None:
     else:
         recoder = None
     try:
+        uname = getattr(os, "uname", None)
+        host = uname().nodename if uname is not None else platform.node()
         lg.info(
-            f"Experiment {name} starts. Group: {group}, Run ID: ({run.id}). PID: ({os.getpid()}). PPID: ({os.getppid()}). Host: ({os.uname()[1]})"
+            f"Experiment {name} starts. Group: {group}, Run ID: ({run.id}). PID: ({os.getpid()}). PPID: ({os.getppid()}). Host: ({host})"
         )
         lg.info(configs)
         if (
@@ -827,7 +852,7 @@ def main() -> None:
             load_model(
                 model,
                 configs.checkpoint.restore_checkpoint,
-                ignore_size_mismatch=int(configs.checkpoint.no_linear),
+                ignore_size_mismatch=bool(int(configs.checkpoint.no_linear)),
             )
             # read the final design eps from the registerd buffer
             final_design_eps = model.final_design_eps
@@ -887,14 +912,14 @@ def main() -> None:
             # in this stage, we will learn the ls_knots so that after interpolaion by the level set and the litho model, the mask could match the target mask
             # which is called inverse lithography
             final_design_eps = model.final_design_eps
+            if final_design_eps is None:
+                raise ValueError("final_design_eps is required for two-stage matching")
             final_design_eps = (final_design_eps - model.eps_bg) / (
                 model.eps_r - model.eps_bg
             )
             matching_model = builder.make_matching_model(
                 device,
-                int(configs.run.random_state)
-                if int(configs.run.deterministic)
-                else None,
+                random_state,
                 final_design_eps[0],
             )
             matching_optimizer = builder.make_optimizer(
@@ -934,9 +959,13 @@ def main() -> None:
                         save_model=False,
                         print_msg=True,
                     )
-        wandb.finish()
     except KeyboardInterrupt:
         lg.warning("Ctrl-C Stopped")
+    finally:
+        try:
+            wandb.finish()
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

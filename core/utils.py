@@ -1,7 +1,7 @@
 import logging
 import math
 import random
-from typing import TYPE_CHECKING, Any
+from typing import Any, cast
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -12,14 +12,11 @@ import torch.optim
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 from torch import Tensor
 
-
-if TYPE_CHECKING:
-    from torch.optim.optimizer import _params_t
-else:
-    _params_t = Any
+_params_t = Any
+optim = cast(Any, torch.optim)
 
 
-class DAdaptAdam(torch.optim.Optimizer):
+class DAdaptAdam(optim.Optimizer):
     r"""
     Implements Adam with D-Adaptation automatic step-sizes.
     Leave LR set to 1 unless you encounter instability.
@@ -288,16 +285,20 @@ class DeterministicCtx:
             self.torch_cuda_random_state = torch.cuda.get_rng_state()
 
         # Set deterministic behavior based on the seed
-        set_torch_deterministic(self.seed)
+        set_torch_deterministic(self.seed if self.seed is not None else 0)
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         # Restore the saved states
+        assert self.random_state is not None
+        assert self.numpy_random_state is not None
+        assert self.torch_random_state is not None
         random.setstate(self.random_state)
         np.random.set_state(self.numpy_random_state)
         torch.random.set_rng_state(self.torch_random_state)
         if torch.cuda.is_available():
-            torch.cuda.set_rng_state(self.torch_cuda_random_state)
+            if self.torch_cuda_random_state is not None:
+                torch.cuda.set_rng_state(self.torch_cuda_random_state)
 
 
 def set_torch_deterministic(seed: int = 0) -> None:
