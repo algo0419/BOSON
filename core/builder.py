@@ -1,5 +1,6 @@
 
 import torch
+from typing import Any, cast
 import torch.nn as nn
 from pyutils.config import configs
 from pyutils.lr_scheduler.warmup_cosine_restart import CosineAnnealingWarmupRestarts
@@ -33,7 +34,10 @@ __all__ = [
     "make_criterion",
 ]
 
-def make_model(device: Device, random_state: int = None, **kwargs) -> nn.Module:
+optim = cast(Any, torch.optim)
+lr_sched = cast(Any, torch.optim.lr_scheduler)
+
+def make_model(device: Device, random_state: int | None = None, **kwargs) -> nn.Module:
     if (
         "repara_phc_1x1" in configs.model.name.lower()
         and "eff_vg" not in configs.model.name.lower()
@@ -165,7 +169,10 @@ def make_model(device: Device, random_state: int = None, **kwargs) -> nn.Module:
 
 
 def make_matching_model(
-    device: Device, random_state: int = None, inital_design: Tensor = None, **kwargs
+    device: Device,
+    random_state: int | None = None,
+    inital_design: Tensor | None = None,
+    **kwargs,
 ) -> nn.Module:
     if "epsmatcher" in configs.matching_model.name.lower():
         model = eval(configs.matching_model.name)(
@@ -206,9 +213,11 @@ def make_matching_model(
     return model
 
 
-def make_optimizer(params, name: str = None, configs=None) -> Optimizer:
+def make_optimizer(params, name: str | None = None, configs=None) -> Optimizer:
+    if configs is None:
+        raise ValueError("configs must be provided")
     if name == "sgd":
-        optimizer = torch.optim.SGD(
+        optimizer = optim.SGD(
             params,
             lr=configs.lr,
             momentum=configs.momentum,
@@ -216,14 +225,14 @@ def make_optimizer(params, name: str = None, configs=None) -> Optimizer:
             nesterov=True,
         )
     elif name == "adam":
-        optimizer = torch.optim.Adam(
+        optimizer = optim.Adam(
             params,
             lr=configs.lr,
             weight_decay=configs.weight_decay,
             betas=getattr(configs, "betas", (0.9, 0.999)),
         )
     elif name == "adamw":
-        optimizer = torch.optim.AdamW(
+        optimizer = optim.AdamW(
             params,
             lr=configs.lr,
             weight_decay=configs.weight_decay,
@@ -236,7 +245,7 @@ def make_optimizer(params, name: str = None, configs=None) -> Optimizer:
             weight_decay=configs.weight_decay,
         )
     elif name == "sam_sgd":
-        base_optimizer = torch.optim.SGD
+        base_optimizer = optim.SGD
         optimizer = SAM(
             params,
             base_optimizer=base_optimizer,
@@ -247,7 +256,7 @@ def make_optimizer(params, name: str = None, configs=None) -> Optimizer:
             momenum=0.9,
         )
     elif name == "sam_adam":
-        base_optimizer = torch.optim.Adam
+        base_optimizer = optim.Adam
         optimizer = SAM(
             params,
             base_optimizer=base_optimizer,
@@ -257,7 +266,7 @@ def make_optimizer(params, name: str = None, configs=None) -> Optimizer:
             weight_decay=configs.weight_decay,
         )
     elif name == "lbfgs":
-        optimizer = torch.optim.LBFGS(
+        optimizer = optim.LBFGS(
             params,
             lr=configs.lr,  # for now, only the lr is tunable, others arguments just use the default value
             line_search_fn=configs.line_search_fn,
@@ -269,9 +278,14 @@ def make_optimizer(params, name: str = None, configs=None) -> Optimizer:
 
 
 def make_scheduler(
-    optimizer: Optimizer, name: str = None, config_file: dict = {}
-) -> Scheduler:
-    name = (name or config_file.name).lower()
+    optimizer: Optimizer, name: str | None = None, config_file=None
+) -> Any:
+    if config_file is None:
+        raise ValueError("config_file must be provided")
+    config_name = name or getattr(config_file, "name", None)
+    if not config_name:
+        raise ValueError("scheduler name is required")
+    name = config_name.lower()
     if (
         name == "temperature"
     ):  # this temperature scheduler is a cosine annealing scheduler
@@ -300,11 +314,11 @@ def make_scheduler(
             mode=configs.eval_prob_scheduler.mode,
         )
     elif name == "constant":
-        scheduler = torch.optim.lr_scheduler.LambdaLR(
+        scheduler = lr_sched.LambdaLR(
             optimizer, lr_lambda=lambda epoch: 1
         )
     elif name == "cosine":
-        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+        scheduler = lr_sched.CosineAnnealingLR(
             optimizer,
             T_max=int(configs.run.n_epochs),
             eta_min=float(configs.lr_scheduler.lr_min),
@@ -318,7 +332,7 @@ def make_scheduler(
             warmup_steps=int(configs.scheduler.warmup_steps),
         )
     elif name == "exp":
-        scheduler = torch.optim.lr_scheduler.ExponentialLR(
+        scheduler = lr_sched.ExponentialLR(
             optimizer, gamma=configs.scheduler.lr_gamma
         )
     else:
@@ -327,8 +341,11 @@ def make_scheduler(
     return scheduler
 
 
-def make_criterion(name: str = None, cfg=None) -> nn.Module:
-    name = (name or configs.criterion.name).lower()
+def make_criterion(name: str | None = None, cfg=None) -> nn.Module:
+    name = name or configs.criterion.name
+    if name is None:
+        raise ValueError("criterion name is required")
+    name = name.lower()
     cfg = cfg or configs.criterion
     if name == "mse":
         criterion = nn.MSELoss()

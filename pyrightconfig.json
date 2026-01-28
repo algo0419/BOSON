@@ -1,0 +1,16 @@
+{
+  "pythonVersion": "3.10",
+  "venvPath": ".",
+  "venv": ".venv",
+  "typeCheckingMode": "basic",
+  "exclude": [
+    "core/ceviche/**",
+    "core/ceviche/ceviche/**",
+    "core/ceviche/examples/**",
+    "core/ceviche/tests/**",
+    "core/models/layers/utils.py",
+    "core/models/layers/inv_design_dev_ceviche.py"
+  ],
+  "reportMissingImports": "none",
+  "reportMissingTypeStubs": "none"
+}

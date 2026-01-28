@@ -1,5 +1,6 @@
 import os
 import subprocess
+import sys
 from multiprocessing import Pool
 
 import mlflow
@@ -152,10 +153,11 @@ def task_launcher(args):
     env = os.environ.copy()
     env['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
 
-    pres = ['python3',
-            script,
-            config_file
-            ]
+    pres = [
+        sys.executable,
+        script,
+        config_file,
+    ]
 
     with open(os.path.join(root, f'device-{device_type}_id-{id}_coupling_init-{coupling_init}_param-{parameterization}_lr-{lr}_initS-{init_s}_finalS-{final_s}_c-{comment}.log'), 'w') as wfid:
         exp = [
